@@ -23,7 +23,6 @@ Run: uvicorn main:app --host 0.0.0.0 --port 8000
 import asyncio
 import logging
 import os
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -81,42 +80,6 @@ AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 QUESTIONS_DIR = Path(__file__).parent / "questions"
 QUESTIONS_DIR.mkdir(exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# DISABLED: console question mode, the bench stand-in for the mic. The mic is
-# the input now. Kept verbatim inside this string so it can be switched back
-# on by deleting the two ''' lines below (and the matching block in ask()).
-# Nothing else about it has been changed. The asyncio and sys imports above
-# are only used by this block and are left in place for the same reason.
-# ---------------------------------------------------------------------------
-'''
-# CONSOLE QUESTION MODE: the press triggers the capture, and the frame's
-# arrival is what prompts you here — so the photo is already uploaded and
-# waiting while you type. Set CONSOLE_QUESTION=0 in .env to skip the prompt
-# and always do a plain label read.
-CONSOLE_QUESTION = os.environ.get("CONSOLE_QUESTION", "1") not in ("0", "false", "False")
-CONSOLE_QUESTION_TIMEOUT = float(os.environ.get("CONSOLE_QUESTION_TIMEOUT", "30"))
-
-
-async def _console_question() -> Optional[str]:
-    """Prompt in this terminal and wait for a typed line. None on timeout."""
-    if not CONSOLE_QUESTION or not sys.stdin or not sys.stdin.isatty():
-        return None
-
-    print(f"\n>>> Photo in. Question? ({CONSOLE_QUESTION_TIMEOUT:.0f}s, "
-          f"Enter alone = just read the label)")
-    try:
-        line = await asyncio.wait_for(
-            asyncio.get_running_loop().run_in_executor(None, sys.stdin.readline),
-            timeout=CONSOLE_QUESTION_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        print("(no answer — reading the label)")
-        return None
-
-    return line.strip() or None
-'''
-
-
 def _question_wav(raw: bytes) -> tuple:
     """Return (wav_bytes, note, levels) for an uploaded recording.
 
@@ -153,7 +116,37 @@ def _save_capture(image_bytes: bytes, tag: str = "") -> Path:
     return path
 
 
-def _speak(spoken: str, confidence: float = 1.0, category: Optional[str] = None,
+# Fixed replies are the same text every time, so their audio is generated
+# once and reused instead of paying for a TTS call (~3 s) on every request.
+REPOSITION_TEXT = "I can't see that clearly. Try turning your head a little, or moving closer."
+_CACHEABLE = {REPOSITION_TEXT}
+_tts_cache: dict = {}
+
+
+def _synthesize_cached(text: str) -> bytes:
+    if text in _tts_cache:
+        return _tts_cache[text]
+    pcm_bytes = tts.synthesize(text)
+    if text in _CACHEABLE:
+        _tts_cache[text] = pcm_bytes
+    return pcm_bytes
+
+
+@app.on_event("startup")
+async def _prewarm_tts_cache():
+    # Fill the cache in the background so even the first "can't see" reply
+    # is instant. A failure here is harmless: it just gets generated on use.
+    def _fill():
+        for text in _CACHEABLE:
+            try:
+                _synthesize_cached(text)
+                logger.info("TTS cache ready: %r", text)
+            except Exception:
+                logger.exception("TTS cache prewarm failed for %r", text)
+    asyncio.get_running_loop().run_in_executor(None, _fill)
+
+
+def _speak(spoken: str, confidence: float = 1.0,
            timer: Optional[timings.Timer] = None) -> Response:
     """Synthesize and return RAW PCM — 16 kHz, 16-bit signed little-endian,
     mono. No container, no compression: the glasses write these bytes
@@ -163,8 +156,9 @@ def _speak(spoken: str, confidence: float = 1.0, category: Optional[str] = None,
     printed — one per request, whatever route through ask() produced it."""
     timer = timer or timings.Timer()
 
-    with timer.stage("tts", f"{tts.MODEL} / {tts.VOICE}"):
-        pcm_bytes = tts.synthesize(spoken)
+    cached = spoken in _tts_cache
+    with timer.stage("tts", "cached" if cached else f"{tts.MODEL} / {tts.VOICE}"):
+        pcm_bytes = _synthesize_cached(spoken)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     audio_path = AUDIO_DIR / f"reply_{stamp}.wav"
@@ -192,7 +186,6 @@ def _speak(spoken: str, confidence: float = 1.0, category: Optional[str] = None,
             "Content-Length": str(len(pcm_bytes)),
             "X-Spoken-Text": spoken,
             "X-Confidence": str(confidence),
-            "X-Category": str(category),
             "X-Sample-Rate": str(tts.SAMPLE_RATE),
             "X-Bits-Per-Sample": "16",
             "X-Channels": "1",
@@ -201,11 +194,14 @@ def _speak(spoken: str, confidence: float = 1.0, category: Optional[str] = None,
 
 
 def _speak_vision_result(result: dict, timer: Optional[timings.Timer] = None) -> Response:
-    if result["needs_reposition"] or result["confidence"] < CONFIDENCE_THRESHOLD:
-        spoken = "I can't see that clearly. Try turning your head a little, or moving closer."
+    # Only fall back to the reposition line when the model isn't confident.
+    # needs_reposition alone doesn't override a confident answer: the model
+    # often flags it while still reading the label correctly.
+    if result["confidence"] < CONFIDENCE_THRESHOLD or not result.get("spoken_summary"):
+        spoken = REPOSITION_TEXT
     else:
         spoken = result["spoken_summary"]
-    return _speak(spoken, result["confidence"], result["category"], timer=timer)
+    return _speak(spoken, result["confidence"], timer=timer)
 
 
 @app.get("/health")
@@ -238,31 +234,6 @@ async def ask(
         timer.note("upload", f"{len(image_bytes)} bytes JPEG")
         with timer.stage("save_capture"):
             _save_capture(image_bytes, tag="ask")
-
-        # DISABLED: the original three-source block, kept verbatim in the string
-        # below. To revert, delete everything from here down to the end of the
-        # mic block and unquote this, then re-enable the console block near the
-        # top of this file.
-        '''
-        # Three sources, in order of how real they are. The console prompt is
-        # the bench stand-in for the mic and wins while the mic is a stub;
-        # question_text is accepted so anything else (curl, a script) can drive
-        # this endpoint; question_audio is the actual product path.
-        question = await _console_question()
-        if question:
-            logger.info("Question (typed here): %r", question)
-        elif question_text:
-            question = question_text
-            logger.info("Question (from client): %r", question)
-        elif question_audio is not None:
-            audio_bytes = await question_audio.read()
-            if audio_bytes:
-                try:
-                    question = stt.transcribe(audio_bytes, filename=question_audio.filename or "q.wav")
-                    logger.info("Transcribed question: %r", question)
-                except Exception:
-                    logger.exception("Transcription failed, falling back to default question")
-        '''
 
         # The mic is the question now: the button press records, and what it
         # recorded arrives here as question_audio. question_text is still

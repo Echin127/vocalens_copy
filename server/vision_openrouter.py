@@ -66,8 +66,6 @@ Respond with ONLY a JSON object, no other text, with these fields:
   label. Not a transcription of every word — the one thing this person needs
   to know right now (e.g. "This is ibuprofen 200mg, use by March 2027" not a
   full reading of the packet).
-- "category": a short 1-3 word category if identifiable (e.g. "medication",
-  "shampoo", "canned food"), or null if not identifiable.
 - "confidence": a float 0.0-1.0 for how confident you are in this reading.
 - "needs_reposition": true if the image is too blurry, too dark, cropped, or
   at an angle that prevents a confident read.
@@ -214,7 +212,6 @@ def answer_audio_question(
     result = _extract_json(raw_text)
 
     result.setdefault("spoken_summary", "I couldn't read that clearly.")
-    result.setdefault("category", None)
     result.setdefault("confidence", 0.0)
     result.setdefault("needs_reposition", False)
     result.setdefault("heard", None)
@@ -252,7 +249,6 @@ def _call_vision(image_bytes: bytes, media_type: str, question: str, user_contex
     result = _extract_json(raw_text)
 
     result.setdefault("spoken_summary", "I couldn't read that clearly.")
-    result.setdefault("category", None)
     result.setdefault("confidence", 0.0)
     result.setdefault("needs_reposition", False)
     return result
