@@ -31,12 +31,14 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include "esp_camera.h"
 #include "pins.h"
 #include "secrets.h"
 #include "mic_capture.h"
 #include "offline_fallback.h"
 #include "wake_word.h"
+
 
 // FEATURE SWITCHES — all three are written but not finished, so they are
 // compiled in and left switched off rather than deleted. Flip one to 1 when
@@ -58,7 +60,10 @@
 bool wifiConnected = false;
 
 void setupWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setSleep(false);  // power saving throttles throughput to a few kB/s
   Serial.print("Connecting to WiFi");
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
@@ -80,6 +85,107 @@ void setupWiFi() {
     //   0 = WL_IDLE_STATUS        -> never really tried (rare)
     Serial.printf("\nWiFi FAILED — offline mode (status code %d)\n", WiFi.status());
   }
+}
+
+// One TLS connection, kept open and reused for every request. Opening a new
+// HTTPS connection costs the ESP32 1-3 s of handshake; reusing it costs
+// nothing. keepServerWarm() pings /health while idle so the connection is
+// still open when the pad is pressed.
+// Touch diagnostics, reported in each keep-alive ping so they show up in the
+// Railway logs even on battery, with no serial monitor.
+extern float touchBaseline;
+uint32_t touchMaxSincePing = 0;
+volatile bool touchNearby = false;
+uint32_t pressCount = 0;
+
+WiFiClientSecure serverClient;
+// Created once and never destroyed. HTTPClient's destructor calls stop() on
+// its connection, so a local HTTPClient hung up at the end of every request
+// and nothing was ever reused.
+HTTPClient serverHttp;
+unsigned long lastServerContact = 0;
+const unsigned long KEEPALIVE_MS = 20000;
+
+void keepServerWarm() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  // Never ping mid-touch: the request blocks this core, and a press during
+  // it is lost.
+  if (touchNearby) return;
+  // Time-based on purpose: if the server is unreachable, retrying every loop
+  // would block the pad for the whole timeout, over and over.
+  if (lastServerContact != 0 && millis() - lastServerContact < KEEPALIVE_MS) return;
+  HTTPClient &http = serverHttp;
+  http.setReuse(true);
+  http.setTimeout(8000);
+  http.begin(serverClient, String("https://") + SERVER_HOST + "/health?base=" +
+             String((uint32_t)touchBaseline) + "&max=" + String(touchMaxSincePing) +
+             "&presses=" + String(pressCount) + "&up=" + String(millis() / 1000));
+  touchMaxSincePing = 0;
+  bool wasOpen = serverClient.connected();
+  int code = http.GET();
+  if (code > 0) http.getString();   // drain so the connection can be reused
+  http.end();
+  Serial.printf("[NET] keep-alive ping: %d, connection was %s, now %s\n", code,
+                wasOpen ? "open" : "closed", serverClient.connected() ? "open" : "closed");
+  if (code != 200) serverClient.stop();
+  lastServerContact = millis();
+}
+
+// Opens the TLS connection on the other CPU core while the wearer is still
+// speaking, so the 1-3 s handshake overlaps the recording instead of adding
+// to the wait afterwards. It has to be the other core: on this one the
+// handshake would block the mic and drop audio.
+static volatile bool warmConnectDone = true;
+
+static void warmConnectTask(void *) {
+  unsigned long t = millis();
+  int ok = serverClient.connect(SERVER_HOST, 443);
+  Serial.printf("[NET] early connect %s in %lums\n", ok ? "OK" : "FAILED", millis() - t);
+  warmConnectDone = true;
+  vTaskDelete(nullptr);
+}
+
+void startWarmConnect() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[NET] early connect skipped: WiFi down");
+    return;
+  }
+  if (serverClient.connected()) {
+    Serial.println("[NET] connection still open from last time");
+    return;
+  }
+  warmConnectDone = false;
+  // 12 kB stack: the TLS handshake needs far more than the default.
+  if (xTaskCreatePinnedToCore(warmConnectTask, "warmConnect", 12288, nullptr,
+                              1, nullptr, 0) != pdPASS) {
+    warmConnectDone = true;   // couldn't start it; the request connects itself
+  }
+}
+
+void waitWarmConnect() {
+  unsigned long started = millis();
+  while (!warmConnectDone && millis() - started < 10000) delay(5);
+}
+
+// Called on every press. On battery the board often boots before the phone
+// hotspot is up, so the boot-time attempt in setupWiFi() fails. Without
+// this, that one failure left the board offline until it was power-cycled.
+bool ensureWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    return true;
+  }
+  Serial.print("WiFi down — reconnecting");
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setSleep(false);
+  for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+    delay(500);
+    Serial.print(".");
+  }
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
+  Serial.println(wifiConnected ? " connected" : " failed");
+  return wifiConnected;
 }
 
 bool setupCamera() {
@@ -153,22 +259,43 @@ bool setupCamera() {
 //     how close the wearer's head is, so it must be calibrated on the
 //     assembled device (the selftest build does this) and rechecked if the
 //     build changes.
+float touchBaseline = 0;
+
+// A press reads 2.5x the idle value. Idle value = touchBaseline, averaged at
+// boot and slowly tracked while untouched.
+#define TOUCH_FACTOR 2.5f
+
+// Averages the untouched reading at power-on (~0.5 s). Don't touch the pad
+// during it; if you do, the drift tracking in manualTriggered() recovers.
+void calibrateTouch() {
+#if !USE_PUSH_BUTTON
+  uint64_t sum = 0;
+  const int n = 25;
+  for (int i = 0; i < n; i++) {
+    sum += touchRead(PIN_TRIGGER);
+    delay(20);
+  }
+  touchBaseline = (float)sum / n;
+  Serial.printf("[PAD] baseline %.0f, touch above %.0f (x%.2f)\n", touchBaseline,
+                touchBaseline * TOUCH_FACTOR, (double)TOUCH_FACTOR);
+#endif
+}
+
 bool manualTriggered() {
 #if USE_PUSH_BUTTON
   // Wired button-to-GND with the internal pull-up enabled, so the pin idles
   // HIGH and reads LOW while pressed. This wiring needs no resistor.
   return digitalRead(PIN_TRIGGER) == LOW;
 #else
-  // Polarity differs across the ESP32 family: on the original ESP32 the
-  // reading FALLS when touched, on the ESP32-S3 it RISES. Run the selftest
-  // build once — it prints the baseline, the touched range, and which of
-  // these two values to use. Guessing makes the pad fire constantly or never
-  // fire, and the wiring looks identical either way.
-#if TOUCH_ACTIVE_HIGH
-  return touchRead(PIN_TRIGGER) > TOUCH_THRESHOLD;
-#else
-  return touchRead(PIN_TRIGGER) < TOUCH_THRESHOLD;
-#endif
+  uint32_t v = touchRead(PIN_TRIGGER);
+  if (v > touchMaxSincePing) touchMaxSincePing = v;
+
+  bool touched = v > touchBaseline * TOUCH_FACTOR;
+  touchNearby = touched;
+
+  // Track slow drift in the idle value while untouched.
+  if (!touched) touchBaseline = touchBaseline * 0.995f + v * 0.005f;
+  return touched;
 #endif
 }
 
@@ -222,6 +349,7 @@ static bool triggerPressedAgain(void *) {
 
 void captureAskAndSpeak() {
   camera_fb_t *fb = nullptr;
+  startWarmConnect();   // handshake runs while the wearer speaks
 
 #if MIC_ENABLED
   uint8_t *audioBuf = (uint8_t *)ps_malloc(MIC_BUFFER_BYTES);
@@ -241,6 +369,7 @@ void captureAskAndSpeak() {
   size_t audioLen = 0;
 #endif
 
+  const unsigned long tStop = millis();   // recording finished
   // Either the mic path never ran, or its capture failed — try once here.
   if (!fb) fb = grabFrame();
   if (!fb) {
@@ -249,7 +378,7 @@ void captureAskAndSpeak() {
     return;
   }
 
-  if (!wifiConnected) {
+  if (!ensureWiFi()) {
 #if OFFLINE_FALLBACK_ENABLED
     Serial.println("No WiFi — falling back to offline barcode scan");
     handleOfflineFallback(fb);
@@ -261,9 +390,11 @@ void captureAskAndSpeak() {
     return;
   }
 
-  HTTPClient http;
-  String url = String("http://") + SERVER_HOST + ":" + SERVER_PORT + "/ask";
-  http.begin(url);
+  waitWarmConnect();
+  HTTPClient &http = serverHttp;
+  http.setReuse(true);
+  String url = String("https://") + SERVER_HOST + "/ask";
+  http.begin(serverClient, url);
   // 90 seconds. Vision plus speech takes several on its own, and on the
   // bench the server is also waiting on a typed question. The library's
   // default is far shorter. A timeout that fires early is invisible from
@@ -313,7 +444,13 @@ void captureAskAndSpeak() {
   }
   memcpy(body + offset, tail.c_str(), tail.length());
 
+  const unsigned long tSend = millis();
+  const bool reused = serverClient.connected();
   int httpCode = http.POST(body, totalLen);
+  const unsigned long tReply = millis();
+  Serial.printf("[TIME] prep %lums | connection %s | upload %u B + server wait %lums\n",
+                tSend - tStop, reused ? "REUSED" : "NEW (handshake)",
+                (unsigned)totalLen, tReply - tSend);
   free(body);
   esp_camera_fb_return(fb);
   if (audioBuf) free(audioBuf);
@@ -332,15 +469,23 @@ void captureAskAndSpeak() {
     int bodyLen = http.getSize();
     Serial.printf("Audio body: %d bytes\n", bodyLen);
     WiFiClient *stream = http.getStreamPtr();
+    const unsigned long tPlay = millis();
     playPcmStream(stream, bodyLen);
+    Serial.printf("[TIME] download+play %lums | stop-speaking -> reply arrived %lums\n",
+                  millis() - tPlay, tReply - tStop);
   } else {
     Serial.printf("Server error: %d\n", httpCode);
   }
   http.end();
+  // A failed or half-read reply can leave junk on the connection; start
+  // clean next time rather than reuse it.
+  if (httpCode != 200) serverClient.stop();
+  lastServerContact = millis();
 }
 
 void setup() {
   Serial.begin(115200);
+  calibrateTouch();
 
 #if USE_PUSH_BUTTON
   // INPUT_PULLUP holds the pin HIGH through an internal resistor, so a plain
@@ -350,6 +495,8 @@ void setup() {
 #endif
 
   setupWiFi();
+  serverClient.setInsecure();
+  keepServerWarm();
   if (!setupCamera()) {
     Serial.println("Halting: camera required");
     while (true) delay(1000);
@@ -406,9 +553,11 @@ void loop() {
 
   if (nowTriggered && !wasTriggered && millis() > ignoreUntil) {
     Serial.println("Triggered — capturing frame");
+    pressCount++;
     captureAskAndSpeak();
     ignoreUntil = millis() + 1500;
   }
   wasTriggered = nowTriggered;
+  if (!nowTriggered) keepServerWarm();
   delay(20);
 }

@@ -117,6 +117,34 @@ static void writeSamples(const int16_t *samples, size_t count) {
   }
 }
 
+// Downloads the WHOLE reply into PSRAM, then plays it from memory. Playing
+// while reading (the previous version) stuttered: over TLS on a phone
+// hotspot the link often can't sustain 32 KB/s, so the DMA ran dry mid-word
+// every time a read lagged. A 15 s reply is ~480 KB against 8 MB of PSRAM.
+
+// Reads up to `want` bytes, waiting for data. Returns bytes read; fewer than
+// asked means the connection ended or stalled.
+static int readSome(WiFiClient *stream, uint8_t *dst, int want) {
+  unsigned long lastData = millis();
+  int got = 0;
+  while (got < want) {
+    size_t avail = stream->available();
+    if (!avail) {
+      if (!stream->connected()) break;
+      if (millis() - lastData > AUDIO_STALL_TIMEOUT_MS) break;
+      delay(1);
+      continue;
+    }
+    if (avail > (size_t)(want - got)) avail = want - got;
+    int n = stream->readBytes(dst + got, avail);
+    if (n > 0) {
+      got += n;
+      lastData = millis();
+    }
+  }
+  return got;
+}
+
 void playPcmStream(WiFiClient *stream, int contentLength) {
   if (!speakerReady) {
     Serial.println("[SPK] not initialised — call setupSpeaker() in setup()");
@@ -129,48 +157,32 @@ void playPcmStream(WiFiClient *stream, int contentLength) {
 
   uint8_t *buf = (uint8_t *)ps_malloc(contentLength);
   if (!buf) {
-    Serial.printf("[SPK] no room for %d bytes\n", contentLength);
+    Serial.printf("[SPK] no PSRAM for %d bytes\n", contentLength);
     return;
   }
 
-  int got = 0;
-  unsigned long lastData = millis();
-  while (got < contentLength) {
-    size_t avail = stream->available();
-    if (!avail) {
-      if (!stream->connected()) break;
-      if (millis() - lastData > AUDIO_STALL_TIMEOUT_MS) {
-        Serial.printf("[SPK] stalled at %d/%d bytes\n", got, contentLength);
-        break;
-      }
-      delay(1);
-      continue;
-    }
-    if (avail > (size_t)(contentLength - got)) avail = contentLength - got;
-    int n = stream->readBytes(buf + got, avail);
-    if (n > 0) {
-      got += n;
-      lastData = millis();
-    }
-  }
-
-  // A short reply is better than none — play whatever arrived.
-  size_t samples = got / sizeof(int16_t);
-  if (!samples) {
+  const unsigned long t0 = millis();
+  int got = readSome(stream, buf, contentLength);
+  Serial.printf("[SPK] downloaded %d/%d bytes in %lums (%.1fs of audio)\n",
+                got, contentLength, millis() - t0,
+                (double)got / (PCM_SAMPLE_RATE * 2));
+  if (got < 2) {
     Serial.println("[SPK] no audio received");
     free(buf);
     return;
   }
+  if (got < contentLength) {
+    Serial.printf("[SPK] stream ended early, %d bytes short — playing what arrived\n",
+                  contentLength - got);
+  }
 
-  Serial.printf("[SPK] playing %u samples (%.1fs)\n", (unsigned)samples,
-                (double)samples / PCM_SAMPLE_RATE);
-
-  // Only clock the DAC while there is audio for it. See setupSpeaker().
+  i2s_zero_dma_buffer(I2S_NUM_1);
   i2s_start(I2S_NUM_1);
-  writeSamples((const int16_t *)buf, samples);
+  writeSamples((const int16_t *)buf, got / 2);
+  // Let the last DMA buffers drain before stopping, or the tail gets cut.
+  delay(150);
   i2s_zero_dma_buffer(I2S_NUM_1);
   i2s_stop(I2S_NUM_1);
-
   free(buf);
   Serial.println("[SPK] playback finished");
 }
